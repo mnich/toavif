@@ -1,0 +1,179 @@
+#!/bin/bash
+#
+# toavif - multi-threaded batch conversion of JPG/JPEG/PNG images to AVIF.
+# https://github.com/mnich/toavif
+
+VERSION="1.0.0"
+
+# Make Homebrew-installed tools (avifenc) visible in cron's minimal environment
+export PATH="$PATH:/opt/homebrew/bin:/usr/local/bin:/home/linuxbrew/.linuxbrew/bin:/usr/bin:/bin:/usr/sbin:/sbin"
+
+# Messages
+MSG_HELP_USAGE="Usage: toavif [-q quality] [-s speed] [-d directory] [-t threads] [--delete]"
+MSG_HELP_OPTIONS="Options:
+  -q, --quality <0-100>  AVIF quality (default: 60)
+  -s, --speed <0-10>     Encoder speed, 0 = slowest/smallest, 10 = fastest (default: 6)
+  -d, --dir <path>       Directory with images (default: ~/Downloads)
+  -t, --threads <n>      Number of parallel jobs (default: logical CPU count)
+      --delete           Delete the original after a successful conversion
+  -v, --version          Show version
+  -h, --help             Show this help"
+MSG_HELP_EXAMPLE="Example: toavif -q 65 -d ~/Downloads -t 8 --delete"
+MSG_ERR_NO_AVIF="Error: Required package 'libavif' is not installed.\nInstall it: brew install libavif"
+MSG_INSTALLING_AVIF="Required package 'libavif' is missing - installing it with Homebrew..."
+MSG_ERR_PARAM="Unknown parameter:"
+MSG_ERR_QUALITY="Error: Quality must be an integer between 0 and 100:"
+MSG_ERR_SPEED="Error: Speed must be an integer between 0 and 10:"
+MSG_ERR_THREADS="Error: Threads must be a positive integer:"
+MSG_ERR_DIR="Error: Directory does not exist:"
+MSG_ERR_VALUE="Error: Missing value for parameter:"
+MSG_LOCKED="Another toavif instance is already running - skipping."
+MSG_START="Starting conversion in directory"
+export MSG_SUCCESS="✅ Converted:"
+export MSG_DELETED="🗑️  Deleted original:"
+export MSG_FAILED="❌ Conversion failed:"
+MSG_DONE="🎉 Operation completed."
+
+# Defaults
+QUALITY=60
+SPEED=6
+DIRECTORY="$HOME/Downloads"
+THREADS=$(sysctl -n hw.logicalcpu 2>/dev/null || nproc 2>/dev/null || echo 4)
+DELETE_ORIGINAL=0
+
+require_value() {
+    if [[ -z "$2" ]]; then
+        echo "$MSG_ERR_VALUE $1" >&2
+        exit 1
+    fi
+}
+
+while [[ "$#" -gt 0 ]]; do
+    case $1 in
+        -q|--quality) require_value "$1" "$2"; QUALITY="$2"; shift ;;
+        -s|--speed) require_value "$1" "$2"; SPEED="$2"; shift ;;
+        -d|--dir) require_value "$1" "$2"; DIRECTORY="$2"; shift ;;
+        -t|--threads) require_value "$1" "$2"; THREADS="$2"; shift ;;
+        --delete) DELETE_ORIGINAL=1 ;;
+        -v|--version)
+            echo "toavif $VERSION"
+            exit 0
+            ;;
+        -h|--help)
+            echo "$MSG_HELP_USAGE"
+            echo
+            echo "$MSG_HELP_OPTIONS"
+            echo
+            echo "$MSG_HELP_EXAMPLE"
+            exit 0
+            ;;
+        *) echo "$MSG_ERR_PARAM $1" >&2; exit 1 ;;
+    esac
+    shift
+done
+
+# Validate input
+if ! [[ "$QUALITY" =~ ^[0-9]+$ ]] || (( QUALITY > 100 )); then
+    echo "$MSG_ERR_QUALITY $QUALITY" >&2
+    exit 1
+fi
+if ! [[ "$SPEED" =~ ^[0-9]+$ ]] || (( SPEED > 10 )); then
+    echo "$MSG_ERR_SPEED $SPEED" >&2
+    exit 1
+fi
+if ! [[ "$THREADS" =~ ^[1-9][0-9]*$ ]]; then
+    echo "$MSG_ERR_THREADS $THREADS" >&2
+    exit 1
+fi
+if [[ ! -d "$DIRECTORY" ]]; then
+    echo "$MSG_ERR_DIR $DIRECTORY" >&2
+    exit 1
+fi
+
+# Install the required libavif package automatically when Homebrew is available
+if ! command -v avifenc &> /dev/null && command -v brew &> /dev/null; then
+    echo "$MSG_INSTALLING_AVIF"
+    brew install libavif
+fi
+if ! command -v avifenc &> /dev/null; then
+    echo -e "$MSG_ERR_NO_AVIF" >&2
+    exit 1
+fi
+
+# Prevent overlapping runs (e.g. a slow cron run still in progress a minute later)
+# Fixed path: cron has no $TMPDIR, so a $TMPDIR-based lock would not exclude interactive runs
+LOCK_DIR="/tmp/toavif-$(id -u).lock"
+if ! mkdir "$LOCK_DIR" 2>/dev/null; then
+    LOCK_PID=$(cat "$LOCK_DIR/pid" 2>/dev/null)
+    # The pid may not be written yet if another instance has just taken the lock
+    [[ -z "$LOCK_PID" ]] && sleep 1 && LOCK_PID=$(cat "$LOCK_DIR/pid" 2>/dev/null)
+    if [[ -n "$LOCK_PID" ]] && kill -0 "$LOCK_PID" 2>/dev/null; then
+        echo "$MSG_LOCKED"
+        exit 0
+    fi
+    # Stale lock left by a killed process - take it over
+    rm -rf "$LOCK_DIR"
+    mkdir "$LOCK_DIR" 2>/dev/null || { echo "$MSG_LOCKED"; exit 0; }
+fi
+echo $$ > "$LOCK_DIR/pid"
+trap '[[ "$(cat "$LOCK_DIR/pid" 2>/dev/null)" == "$$" ]] && rm -rf "$LOCK_DIR"' EXIT
+
+# Export variables for the subprocesses spawned by xargs (bash -c)
+export QUALITY
+export SPEED
+export DELETE_ORIGINAL
+
+echo "$MSG_START '$DIRECTORY' (Q: $QUALITY, Speed: $SPEED, Threads: $THREADS, Delete: $DELETE_ORIGINAL)..."
+
+# -print0 / -0 keep paths with spaces and special characters intact.
+# Each file is processed by its own bash process; '_' fills in $0.
+set -o pipefail
+find "$DIRECTORY" -type f \( -iname '*.jpg' -o -iname '*.jpeg' -o -iname '*.png' \) -print0 | \
+xargs -0 -P "$THREADS" -n 1 "$BASH" -c '
+    file="$1"
+    filename="${file%.*}"
+    target="${filename}.avif"
+
+    # Never overwrite an existing .avif: it may come from another image with the
+    # same base name (photo.jpg / photo.png), whose original may already be deleted
+    if [[ -e "$target" ]]; then
+        exit 0
+    fi
+
+    # Write to a per-process temporary file first so an interrupted run never
+    # leaves a truncated .avif and parallel jobs never share a temp file.
+    # -j 1: parallelism comes from xargs, so each encoder uses a single thread.
+    tmp="${filename}.toavif-tmp.$$.avif"
+    if ! avifenc -q "$QUALITY" -s "$SPEED" -j 1 "$file" "$tmp" > /dev/null; then
+        rm -f "$tmp"
+        echo "$MSG_FAILED $file" >&2
+        exit 1
+    fi
+
+    # ln fails atomically if $target appeared in the meantime (a same-named image
+    # converted in parallel); mv -n is the fallback for filesystems without hard links
+    if ! ln "$tmp" "$target" 2>/dev/null; then
+        [[ -e "$target" ]] || mv -n "$tmp" "$target"
+    fi
+    if [[ -e "$tmp" ]] && ! [[ "$tmp" -ef "$target" ]]; then
+        rm -f "$tmp"
+        # Lost the race to a same-named image: keep this original untouched
+        [[ -e "$target" ]] && exit 0
+        echo "$MSG_FAILED $file" >&2
+        exit 1
+    fi
+    rm -f "$tmp"
+
+    echo "$MSG_SUCCESS $file -> $target"
+    if [[ "$DELETE_ORIGINAL" == "1" ]]; then
+        if ! rm -f "$file"; then
+            echo "$MSG_FAILED $file" >&2
+            exit 1
+        fi
+        echo "$MSG_DELETED $file"
+    fi
+' _
+STATUS=$?
+
+echo "$MSG_DONE"
+exit $(( STATUS != 0 ))
