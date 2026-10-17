@@ -46,6 +46,9 @@ toavif [OPTIONS]
 | `-s`, `--speed <0-10>` | Encoder speed: `0` = slowest / smallest files, `10` = fastest (default: `6`) |
 | `-d`, `--dir <path>` | Directory with images (default: `~/Downloads`) |
 | `-t`, `--threads <n>` | Number of parallel jobs (default: number of logical cores) |
+| `--max-depth <n>` | Descend at most `n` directory levels; `1` = only the directory itself (default: unlimited) |
+| `--newer-than <file>` | Only process images added or changed after `<file>` was last changed |
+| `--min-age <minutes>` | Skip images modified less than `<minutes>` ago, e.g. still downloading (default: `0`) |
 | `--delete` | Delete the original `.jpg` / `.jpeg` / `.png` after a successful conversion |
 | `-v`, `--version` | Show version |
 | `-h`, `--help` | Show help |
@@ -79,8 +82,16 @@ crontab -e
 and add the following line to run it every minute (use the absolute path to the binary – `/opt/homebrew/bin/toavif` on Apple Silicon, `/usr/local/bin/toavif` on Intel Macs – and to the directory):
 
 ```cron
-* * * * * /opt/homebrew/bin/toavif -d /Users/YOUR_USERNAME/Downloads --delete > /tmp/toavif_cron.log 2>&1
+* * * * * /opt/homebrew/bin/toavif -d /Users/YOUR_USERNAME/Downloads --max-depth 1 --newer-than /Users/YOUR_USERNAME/.toavif-since --min-age 1 > /tmp/toavif_cron.log 2>&1
 ```
+
+Before enabling it, create the reference file once: `touch ~/.toavif-since`. Together the options make the job:
+
+- `--max-depth 1` – look only at `Downloads` itself, not at extracted archives or project folders inside it,
+- `--newer-than` – ignore images that were already there when the job was set up (only new arrivals are converted),
+- `--min-age 1` – wait until a file has not changed for a minute, so half-downloaded images are never picked up.
+
+Add `--delete` if the originals should be removed after conversion.
 
 Watch the log live with:
 
